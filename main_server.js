@@ -9,7 +9,10 @@
  *    - /sensor-info
  *    - /measurement-mgdl
  *    - /measurement-mmol
- *    Using the same arrow logic (difference in mg/dL) for Trend.
+ *
+ *    Now also includes:
+ *      - measurementColor: numeric (1..4)
+ *      - measurementColorName: mapped string ("green", "yellow", "orange", "red")
  */
 
 const fs = require('fs');
@@ -23,14 +26,14 @@ const https = require('https');
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 // Configuration: SSL certificate & key paths
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-const keyFile = '/home/pi/ssl/mykey.key';   // <-- Change to your path
-const certFile = '/home/pi/ssl/mycert.crt'; // <-- Change to your path
+const keyFile = '/home/local/librelinkup-api/private.key';    // <-- Adjust as needed
+const certFile = '/home/local/librelinkup-api/certificate.crt'; // <-- Adjust as needed
 
 // Load the SSL credentials
 const sslOptions = {
   key: fs.readFileSync(keyFile),
   cert: fs.readFileSync(certFile)
-  // If you have an intermediate bundle, you can add `ca: fs.readFileSync('/path/to/chainfile.pem')`
+  // If you have an intermediate bundle, you can add: ca: fs.readFileSync('/path/to/chainfile.pem')
 };
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
@@ -122,7 +125,7 @@ function writeMeasurementsFile(arr) {
 }
 
 /**
- * Remove any measurements from previous days. 
+ * Remove any measurements from previous days.
  * We'll keep only items whose local date is "today" (based on local time).
  */
 function purgeOldMeasurements(arr) {
@@ -205,7 +208,7 @@ async function doAuthContinue(prevResponse) {
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 function arrowToEmoji(num) {
   switch (num) {
-    case 1: return '⬇️'; 
+    case 1: return '⬇️';
     case 2: return '↘️';
     case 3: return '➡️';
     case 4: return '↗️';
@@ -215,48 +218,81 @@ function arrowToEmoji(num) {
 }
 
 function computeSinceLastTrendArrowNumber(diff) {
-  if (diff === 0)         return 3;  // stable
-  if (diff > 0 && diff <= 5) return 4;  // slight up
-  if (diff > 5)              return 5;  // up
-  if (diff < 0 && diff >= -5) return 2;  // slight down
-  return 1;                            // down
+  if (diff === 0)           return 3; // stable
+  if (diff > 0 && diff <= 5)  return 4; // slight up
+  if (diff > 5)              return 5; // up
+  if (diff < 0 && diff >= -5) return 2; // slight down
+  return 1; // down
+}
+
+/**
+ * MeasurementColor to Name
+ * 1 => "green"
+ * 2 => "yellow"
+ * 3 => "orange"
+ * 4 => "red"
+ */
+function measurementColorName(num) {
+  switch (num) {
+    case 1: return 'green';
+    case 2: return 'yellow';
+    case 3: return 'orange';
+    case 4: return 'red';
+    default: return 'unknown';
+  }
+}
+
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+// parseLibreTimestamp(ts) => Date
+// "1/5/2025 10:33:54 PM" => JavaScript Date
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+function parseLibreTimestamp(ts) {
+  // e.g. "1/5/2025 10:33:54 PM"
+  const [datePart, timePart, ampm] = ts.split(' ');
+  const [month, day, year] = datePart.split('/');
+  const [hh, mm, ss] = timePart.split(':');
+
+  let hour = parseInt(hh, 10);
+  const minute = parseInt(mm, 10);
+  const second = parseInt(ss, 10);
+
+  if (ampm.toUpperCase() === 'PM' && hour < 12) hour += 12;
+  if (ampm.toUpperCase() === 'AM' && hour === 12) hour = 0;
+
+  // new Date(year, monthIndex, day, hour, minute, second)
+  return new Date(+year, +month - 1, +day, hour, minute, second);
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 // scheduleNextFetch(lastTimestampString):
 //   - parse lastTimestamp into a Date
 //   - add 60 seconds
-//   - add small offset (2 seconds)
-//   - compute the delayMs = nextDate - now
+//   - add offset
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 function scheduleNextFetch(lastTimestamp) {
-  const offsetSeconds = 2;
-  const lastDate = new Date(lastTimestamp); 
-  // Add 60 seconds
-  const nextDate = new Date(lastDate.getTime() + 60_000);
-  // Then add an offset
+  const offsetSeconds = 3;
+  const lastDate = new Date(lastTimestamp);
+  const nextDate = new Date(lastDate.getTime() + 120_000);
   const finalDate = new Date(nextDate.getTime() + offsetSeconds * 1000);
 
   const now = new Date();
   let delayMs = finalDate - now;
-
-  // If next time is in the past or too soon, fallback to 30s
   if (delayMs < 1000) {
     delayMs = 30_000;
   }
-  
+
   console.log(`[DEBUG] Last reading timestamp: ${lastTimestamp}`);
-  console.log(`[DEBUG] Scheduling next fetch ~ ${finalDate.toLocaleTimeString()} => ${delayMs}ms from now.`);
+  console.log(`[DEBUG] Scheduling next fetch ~ ${finalDate.toLocaleTimeString()} => ${delayMs}ms`);
   return delayMs;
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 // fetchAndStoreMeasurement
-//  - ensures login
-//  - fetches latest measurement
-//  - merges into file
-//  - updates memoryData for express
-//  - returns the last reading's timestamp
+//  1) ensures login
+//  2) fetches latest measurement => "1/5/2025 10:33:54 PM" style
+//  3) parse => ISO string
+//  4) store => memoryData
+//  5) return isoStamp for scheduling
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 async function fetchAndStoreMeasurement() {
   const cacheObj = readCache();
@@ -268,23 +304,22 @@ async function fetchAndStoreMeasurement() {
     cacheObj.token = token;
     cacheObj.userId = userId;
     cacheObj.accountIdHash = accountIdHash;
-    cacheObj.email = email; // optional
     writeCache(cacheObj);
   } else {
     console.log('[INFO] Using cached token/userId...');
   }
 
-  // attach headers
+  // Attach headers
   apiClient.defaults.headers.common['Authorization'] = `Bearer ${cacheObj.token}`;
   apiClient.defaults.headers.common['Account-Id'] = cacheObj.accountIdHash;
   apiClient.defaults.headers.common['patientid'] = cacheObj.userId;
 
-  // get first patient
-  const resp = await apiClient.get('/llu/connections');
-  if (resp.data.status !== 0) {
-    throw new Error(`Fetching /llu/connections => status=${resp.data.status}`);
+  // 1) get connections
+  const connectionsResp = await apiClient.get('/llu/connections');
+  if (connectionsResp.data.status !== 0) {
+    throw new Error(`Fetching /llu/connections => status=${connectionsResp.data.status}`);
   }
-  const connections = resp.data.data || [];
+  const connections = connectionsResp.data.data || [];
   if (!connections.length) {
     console.log('[WARN] No connections found!');
     return null;
@@ -293,11 +328,12 @@ async function fetchAndStoreMeasurement() {
   const { patientId, firstName, lastName, sensor } = connections[0];
   console.log(`[INFO] Found patient => ${firstName} ${lastName}, id=${patientId}`);
 
-  // fetch latest measurement
+  // 2) fetch latest measurement => "Timestamp" might be "1/5/2025 10:33:54 PM"
   const cgmResp = await apiClient.get(`/llu/connections/${patientId}/graph`);
   if (cgmResp.data.status !== 0) {
     throw new Error(`CGM data => status=${cgmResp.data.status}`);
   }
+
   const cgmData = cgmResp.data.data;
   const latest = cgmData?.connection?.glucoseMeasurement;
   if (!latest) {
@@ -305,17 +341,23 @@ async function fetchAndStoreMeasurement() {
     return null;
   }
 
-  // read existing measurements, purge old day
+  // 3) Convert => ISO8601
+  const rawTs = latest.Timestamp; // "1/5/2025 10:33:54 PM"
+  const parsedDate = parseLibreTimestamp(rawTs);  // to JS Date
+  const isoStamp = parsedDate.toISOString();      // e.g. "2025-01-05T22:33:54.000Z"
+
+  // Read existing measurements, purge old day
   let measurementsArr = readMeasurementsFile();
   measurementsArr = purgeOldMeasurements(measurementsArr);
 
-  // compare to last measurement if <24 min
+  // Compare with previous for "SinceLastTrendArrow" if <24 min
   let sinceLastTrendEmoji = 'N/A';
   if (measurementsArr.length > 0) {
     const prev = measurementsArr[measurementsArr.length - 1];
-    const timeDiffMin = (new Date(latest.Timestamp) - new Date(prev.Timestamp)) / 1000 / 60;
-    console.log(`[INFO] Time difference from last measurement: ${timeDiffMin.toFixed(1)} min`);
-    if (timeDiffMin <= 24) {
+    const prevDate = new Date(prev.Timestamp);
+    const diffMinutes = (parsedDate - prevDate) / 1000 / 60;
+    console.log(`[INFO] Time difference from last measurement: ${diffMinutes.toFixed(1)} min`);
+    if (diffMinutes <= 24) {
       const diffVal = latest.ValueInMgPerDl - prev.ValueInMgPerDl;
       const arrowNum = computeSinceLastTrendArrowNumber(diffVal);
       sinceLastTrendEmoji = arrowToEmoji(arrowNum);
@@ -323,15 +365,15 @@ async function fetchAndStoreMeasurement() {
     }
   }
 
-  // store new measurement in file
+  // 4) Save new measurement in file
   measurementsArr.push({
-    Timestamp: latest.Timestamp,
+    Timestamp: isoStamp, // <-- NOTE: we store the ISO8601 in the file, not the raw M/d/...
     ValueInMgPerDl: latest.ValueInMgPerDl,
     TrendArrow: latest.TrendArrow
   });
   writeMeasurementsFile(measurementsArr);
 
-  // update in-memory data
+  // 5) Update memoryData
   memoryData.patientInfo = { firstName, lastName };
 
   let deviceName = `Unknown (pt=${sensor?.pt})`;
@@ -347,35 +389,43 @@ async function fetchAndStoreMeasurement() {
     ptName: deviceName
   } : null;
 
+  // MeasurementColor => colorName
+  const colorNumber = latest.MeasurementColor || 0;
+  const colorName   = measurementColorName(colorNumber);
+
   // mg/dL measurement
   memoryData.measurementMgdl = {
-    Timestamp: latest.Timestamp,
+    Timestamp: isoStamp, // <-- NOTE: Use ISO stamp
     ValueInMgPerDl: latest.ValueInMgPerDl,
     TrendArrow: latest.TrendArrow,
     TrendArrowEmoji: arrowToEmoji(latest.TrendArrow),
-    SinceLastTrendArrow: sinceLastTrendEmoji
+    SinceLastTrendArrow: sinceLastTrendEmoji,
+    MeasurementColor: colorNumber,
+    MeasurementColorName: colorName
   };
 
   // mmol measurement
   const mmolVal = Math.round((latest.ValueInMgPerDl / 18) * 10) / 10;
   memoryData.measurementMmol = {
-    Timestamp: latest.Timestamp,
+    Timestamp: isoStamp, // <-- NOTE: Also ISO
     ValueInMmolPerL: mmolVal,
     TrendArrow: latest.TrendArrow,
     TrendArrowEmoji: arrowToEmoji(latest.TrendArrow),
-    SinceLastTrendArrow: sinceLastTrendEmoji
+    SinceLastTrendArrow: sinceLastTrendEmoji,
+    MeasurementColor: colorNumber,
+    MeasurementColorName: colorName
   };
 
-  // Return the last reading's timestamp so we can schedule the next fetch
-  return latest.Timestamp;
+  // Return isoStamp so we can schedule next fetch properly
+  return isoStamp; // <-- NOTE: changed from 'latest.Timestamp' to isoStamp
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-// Start an HTTPS server for serving the data in memoryData
+// Start HTTPS server
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 function startHttpsServer() {
   const app = express();
-  const PORT = 8443; // or 443 if you prefer
+  const PORT = 443; // or 8443 if you prefer
 
   // /patient-info
   app.get('/patient-info', (req, res) => {
@@ -409,7 +459,6 @@ function startHttpsServer() {
     return res.json(memoryData.measurementMmol);
   });
 
-  // Create an HTTPS server using our sslOptions
   const server = https.createServer(sslOptions, app);
   server.listen(PORT, () => {
     console.log(`[INFO] HTTPS server running on port ${PORT}`);
@@ -418,40 +467,29 @@ function startHttpsServer() {
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-// The main "cycle" logic: 
-//   1) fetchAndStoreMeasurement()
-//   2) parse the last reading's timestamp
-//   3) schedule the next fetch for lastTimestamp + 60s + offset
+// The main "cycle" logic:
+// fetchAndStoreMeasurement(), then schedule next fetch
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 async function fetchCycle() {
   try {
     const lastTimestamp = await fetchAndStoreMeasurement();
     if (!lastTimestamp) {
-      // if we didn't get a valid reading, schedule a fallback in 60s
       console.log('[WARN] No lastTimestamp => scheduling next fetch in 60s');
       setTimeout(fetchCycle, 60_000);
       return;
     }
-    // compute how many ms until the next fetch
     const ms = scheduleNextFetch(lastTimestamp);
     console.log(`[INFO] Next fetch in ${(ms / 1000).toFixed(1)}s`);
     setTimeout(fetchCycle, ms);
   } catch (err) {
     console.error('[ERROR] fetchCycle failed:', err.message);
-    // fallback: schedule next attempt in 60s
     setTimeout(fetchCycle, 60_000);
   }
 }
 
-// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-// main(): start HTTPS server & do the first fetchCycle
-// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 async function main() {
-  // 1) Start HTTPS express server
   startHttpsServer();
-
-  // 2) Start the cycle
-  await fetchCycle(); 
+  await fetchCycle();
 }
 
 main().catch((err) => {
