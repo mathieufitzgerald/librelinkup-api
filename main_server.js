@@ -1,14 +1,15 @@
 #!/usr/bin/env node
 /**
- *  1) Reads/writes local `cache.json` for token & userId (prompts if missing)
- *  2) Fetches "latest measurement" from /llu/connections/{patientId}/graph once per minute
- *  3) Stores each "latest measurement" in `latestMeasurements.json` (only today's remain)
- *  4) Exposes an HTTPS server with endpoints:
- *      /patient-info
- *      /sensor-info
- *      /measurement-mgdl
- *      /measurement-mmol
- *    All using the same arrow logic (difference in mg/dL) for Trend.
+ * 1) Reads/writes local `cache.json` for token & userId (prompts if missing)
+ * 2) Dynamically fetches "latest measurement" from /llu/connections/{patientId}/graph,
+ *    scheduling the next request based on the last reading's exact timestamp + 60s + offset.
+ * 3) Stores each "latest measurement" in `latestMeasurements.json` (only today's remain)
+ * 4) Exposes an HTTPS server with endpoints:
+ *    - /patient-info
+ *    - /sensor-info
+ *    - /measurement-mgdl
+ *    - /measurement-mmol
+ *    Using the same arrow logic (difference in mg/dL) for Trend.
  */
 
 const fs = require('fs');
@@ -222,14 +223,42 @@ function computeSinceLastTrendArrowNumber(diff) {
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-// fetchAndStoreMeasurement:
+// scheduleNextFetch(lastTimestampString):
+//   - parse lastTimestamp into a Date
+//   - add 60 seconds
+//   - add small offset (2 seconds)
+//   - compute the delayMs = nextDate - now
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+function scheduleNextFetch(lastTimestamp) {
+  const offsetSeconds = 2;
+  const lastDate = new Date(lastTimestamp); 
+  // Add 60 seconds
+  const nextDate = new Date(lastDate.getTime() + 60_000);
+  // Then add an offset
+  const finalDate = new Date(nextDate.getTime() + offsetSeconds * 1000);
+
+  const now = new Date();
+  let delayMs = finalDate - now;
+
+  // If next time is in the past or too soon, fallback to 30s
+  if (delayMs < 1000) {
+    delayMs = 30_000;
+  }
+  
+  console.log(`[DEBUG] Last reading timestamp: ${lastTimestamp}`);
+  console.log(`[DEBUG] Scheduling next fetch ~ ${finalDate.toLocaleTimeString()} => ${delayMs}ms from now.`);
+  return delayMs;
+}
+
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+// fetchAndStoreMeasurement
 //  - ensures login
 //  - fetches latest measurement
 //  - merges into file
 //  - updates memoryData for express
+//  - returns the last reading's timestamp
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 async function fetchAndStoreMeasurement() {
-  // 1) read token, maybe prompt
   const cacheObj = readCache();
   if (!cacheObj.token || !cacheObj.userId || !cacheObj.accountIdHash) {
     console.log('[INFO] No valid token => prompting for credentials...');
@@ -245,12 +274,12 @@ async function fetchAndStoreMeasurement() {
     console.log('[INFO] Using cached token/userId...');
   }
 
-  // 2) attach headers
+  // attach headers
   apiClient.defaults.headers.common['Authorization'] = `Bearer ${cacheObj.token}`;
   apiClient.defaults.headers.common['Account-Id'] = cacheObj.accountIdHash;
   apiClient.defaults.headers.common['patientid'] = cacheObj.userId;
 
-  // 3) get first patient
+  // get first patient
   const resp = await apiClient.get('/llu/connections');
   if (resp.data.status !== 0) {
     throw new Error(`Fetching /llu/connections => status=${resp.data.status}`);
@@ -258,13 +287,13 @@ async function fetchAndStoreMeasurement() {
   const connections = resp.data.data || [];
   if (!connections.length) {
     console.log('[WARN] No connections found!');
-    return;
+    return null;
   }
 
   const { patientId, firstName, lastName, sensor } = connections[0];
   console.log(`[INFO] Found patient => ${firstName} ${lastName}, id=${patientId}`);
 
-  // 4) fetch latest measurement
+  // fetch latest measurement
   const cgmResp = await apiClient.get(`/llu/connections/${patientId}/graph`);
   if (cgmResp.data.status !== 0) {
     throw new Error(`CGM data => status=${cgmResp.data.status}`);
@@ -273,10 +302,10 @@ async function fetchAndStoreMeasurement() {
   const latest = cgmData?.connection?.glucoseMeasurement;
   if (!latest) {
     console.log('[WARN] No latest measurement from server!');
-    return;
+    return null;
   }
 
-  // 5) read existing measurements, purge old day
+  // read existing measurements, purge old day
   let measurementsArr = readMeasurementsFile();
   measurementsArr = purgeOldMeasurements(measurementsArr);
 
@@ -294,7 +323,7 @@ async function fetchAndStoreMeasurement() {
     }
   }
 
-  // 6) store new measurement in file
+  // store new measurement in file
   measurementsArr.push({
     Timestamp: latest.Timestamp,
     ValueInMgPerDl: latest.ValueInMgPerDl,
@@ -302,19 +331,14 @@ async function fetchAndStoreMeasurement() {
   });
   writeMeasurementsFile(measurementsArr);
 
-  // 7) update in-memory data for the Express server
-  // patient info
-  memoryData.patientInfo = {
-    firstName,
-    lastName
-  };
+  // update in-memory data
+  memoryData.patientInfo = { firstName, lastName };
 
-  // sensor info
   let deviceName = `Unknown (pt=${sensor?.pt})`;
   if (sensor?.pt === 4) deviceName = 'Freestyle Libre 3';
   if (sensor?.pt === 1) deviceName = 'Freestyle Libre 2';
   if (sensor?.pt === 0) deviceName = 'Freestyle Libre 1';
-  
+
   const sensorDate = sensor ? new Date(sensor.a * 1000) : null;
   memoryData.sensorInfo = sensor ? {
     sn: sensor.sn,
@@ -337,11 +361,13 @@ async function fetchAndStoreMeasurement() {
   memoryData.measurementMmol = {
     Timestamp: latest.Timestamp,
     ValueInMmolPerL: mmolVal,
-    // We use the same arrow from mg/dL difference => official TrendArrow
     TrendArrow: latest.TrendArrow,
     TrendArrowEmoji: arrowToEmoji(latest.TrendArrow),
     SinceLastTrendArrow: sinceLastTrendEmoji
   };
+
+  // Return the last reading's timestamp so we can schedule the next fetch
+  return latest.Timestamp;
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
@@ -392,27 +418,40 @@ function startHttpsServer() {
 }
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
-// main(): schedule the fetch once per minute, start HTTPS server
+// The main "cycle" logic: 
+//   1) fetchAndStoreMeasurement()
+//   2) parse the last reading's timestamp
+//   3) schedule the next fetch for lastTimestamp + 60s + offset
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+async function fetchCycle() {
+  try {
+    const lastTimestamp = await fetchAndStoreMeasurement();
+    if (!lastTimestamp) {
+      // if we didn't get a valid reading, schedule a fallback in 60s
+      console.log('[WARN] No lastTimestamp => scheduling next fetch in 60s');
+      setTimeout(fetchCycle, 60_000);
+      return;
+    }
+    // compute how many ms until the next fetch
+    const ms = scheduleNextFetch(lastTimestamp);
+    console.log(`[INFO] Next fetch in ${(ms / 1000).toFixed(1)}s`);
+    setTimeout(fetchCycle, ms);
+  } catch (err) {
+    console.error('[ERROR] fetchCycle failed:', err.message);
+    // fallback: schedule next attempt in 60s
+    setTimeout(fetchCycle, 60_000);
+  }
+}
+
+// ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+// main(): start HTTPS server & do the first fetchCycle
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 async function main() {
   // 1) Start HTTPS express server
   startHttpsServer();
 
-  // 2) Immediately fetch once
-  try {
-    await fetchAndStoreMeasurement();
-  } catch (err) {
-    console.error('[ERROR] initial fetch failed:', err.message);
-  }
-
-  // 3) Then fetch every minute
-  setInterval(async () => {
-    try {
-      await fetchAndStoreMeasurement();
-    } catch (err) {
-      console.error('[ERROR] scheduled fetch failed:', err.message);
-    }
-  }, 60_000);
+  // 2) Start the cycle
+  await fetchCycle(); 
 }
 
 main().catch((err) => {
