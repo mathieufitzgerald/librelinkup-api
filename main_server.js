@@ -145,7 +145,8 @@ function sha256Hex(str) {
 }
 
 function updateBaseURL(region) {
-  baseURL = `https://api-${region}.libreview.io`;
+  baseURL = 'https://api.libreview.io';
+//  baseURL = `https://api-${region}.libreview.io`;
   apiClient.defaults.baseURL = baseURL;
   console.log('[INFO] Updated baseURL =>', baseURL);
 }
@@ -272,7 +273,7 @@ function parseLibreTimestamp(ts) {
 function scheduleNextFetch(lastTimestamp) {
   const offsetSeconds = 3;
   const lastDate = new Date(lastTimestamp);
-  const nextDate = new Date(lastDate.getTime() + 120_000);
+  const nextDate = new Date(lastDate.getTime() + 60_000);
   const finalDate = new Date(nextDate.getTime() + offsetSeconds * 1000);
 
   const now = new Date();
@@ -294,6 +295,7 @@ function scheduleNextFetch(lastTimestamp) {
 //  4) store => memoryData
 //  5) return isoStamp for scheduling
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
+
 async function fetchAndStoreMeasurement() {
   const cacheObj = readCache();
   if (!cacheObj.token || !cacheObj.userId || !cacheObj.accountIdHash) {
@@ -347,7 +349,7 @@ async function fetchAndStoreMeasurement() {
   const isoStamp = parsedDate.toISOString();      // e.g. "2025-01-05T22:33:54.000Z"
 
   // Read existing measurements, purge old day
-  let measurementsArr = readMeasurementsFile();
+let measurementsArr = readMeasurementsFile();
   measurementsArr = purgeOldMeasurements(measurementsArr);
 
   // Compare with previous for "SinceLastTrendArrow" if <24 min
@@ -425,7 +427,7 @@ async function fetchAndStoreMeasurement() {
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
 function startHttpsServer() {
   const app = express();
-  const PORT = 443; // or 8443 if you prefer
+  const PORT = 8443; // or 8443 if you prefer
 
   // /patient-info
   app.get('/patient-info', (req, res) => {
