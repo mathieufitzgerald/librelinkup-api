@@ -300,7 +300,7 @@ function scheduleNextFetch(lastTimestamp) {
 
 async function fetchAndStoreMeasurement() {
   const cacheObj = readCache();
-  
+
   // Ensure token, userId, accountIdHash, and patientId are cached
   if (!cacheObj.token || !cacheObj.userId || !cacheObj.accountIdHash) {
     console.log('[INFO] No valid token => prompting for credentials...');
@@ -319,7 +319,7 @@ async function fetchAndStoreMeasurement() {
   apiClient.defaults.headers.common['Authorization'] = `Bearer ${cacheObj.token}`;
   apiClient.defaults.headers.common['Account-Id'] = cacheObj.accountIdHash;
 
-  // Fetch patientId if not already cached
+  // Fetch patientId and additional info if not cached
   if (!cacheObj.patientId) {
     console.log('[INFO] No cached patientId, fetching from /llu/connections...');
     const connectionsResp = await apiClient.get('/llu/connections');
@@ -331,18 +331,43 @@ async function fetchAndStoreMeasurement() {
       console.log('[WARN] No connections found!');
       return null;
     }
-    const { patientId } = connections[0];
-    console.log(`[INFO] Caching patientId: ${patientId}`);
+
+    const { patientId, firstName, lastName, sensor } = connections[0];
     cacheObj.patientId = patientId;
+    cacheObj.firstName = firstName;
+    cacheObj.lastName = lastName;
+    cacheObj.sensor = sensor; // Cache the full sensor object
     writeCache(cacheObj);
   } else {
     console.log(`[INFO] Using cached patientId: ${cacheObj.patientId}`);
   }
 
-  // Use the cached patientId
-  const patientId = cacheObj.patientId;
+  // Update memoryData with patient and sensor info
+  memoryData.patientInfo = {
+    firstName: cacheObj.firstName,
+    lastName: cacheObj.lastName,
+    patientId: cacheObj.patientId
+  };
 
-  // Fetch latest measurement
+  if (cacheObj.sensor) {
+    const sensorDate = new Date(cacheObj.sensor.a * 1000);
+    const deviceName =
+      cacheObj.sensor.pt === 4 ? 'Freestyle Libre 3' :
+      cacheObj.sensor.pt === 1 ? 'Freestyle Libre 2' :
+      cacheObj.sensor.pt === 0 ? 'Freestyle Libre 1' : 'Unknown';
+
+    memoryData.sensorInfo = {
+      sn: cacheObj.sensor.sn,
+      activationUnix: cacheObj.sensor.a,
+      activationDateStr: sensorDate.toLocaleString(),
+      ptName: deviceName
+    };
+  } else {
+    memoryData.sensorInfo = null; // Ensure it's cleared if not available
+  }
+
+  // Use the cached patientId to fetch the latest measurement
+  const patientId = cacheObj.patientId;
   const cgmResp = await apiClient.get(`/llu/connections/${patientId}/graph`);
   if (cgmResp.data.status !== 0) {
     throw new Error(`CGM data => status=${cgmResp.data.status}`);
@@ -355,70 +380,39 @@ async function fetchAndStoreMeasurement() {
     return null;
   }
 
-  // Convert timestamp to ISO8601 format
-  const rawTs = latest.Timestamp; // "1/5/2025 10:33:54 PM"
-  const parsedDate = parseLibreTimestamp(rawTs);  // to JS Date
-  const isoStamp = parsedDate.toISOString();      // e.g. "2025-01-05T22:33:54.000Z"
+  // Process latest measurement and store it
+  const rawTs = latest.Timestamp;
+  const parsedDate = parseLibreTimestamp(rawTs);
+  const isoStamp = parsedDate.toISOString();
 
-  // Process measurements file
   let measurementsArr = readMeasurementsFile();
   measurementsArr = purgeOldMeasurements(measurementsArr);
 
-  // Compute "SinceLastTrendArrow" if recent data exists
-  let sinceLastTrendEmoji = 'N/A';
-  if (measurementsArr.length > 0) {
-    const prev = measurementsArr[measurementsArr.length - 1];
-    const prevDate = new Date(prev.Timestamp);
-    const diffMinutes = (parsedDate - prevDate) / 1000 / 60;
-    console.log(`[INFO] Time difference from last measurement: ${diffMinutes.toFixed(1)} min`);
-    if (diffMinutes <= 24) {
-      const diffVal = latest.ValueInMgPerDl - prev.ValueInMgPerDl;
-      const arrowNum = computeSinceLastTrendArrowNumber(diffVal);
-      sinceLastTrendEmoji = arrowToEmoji(arrowNum);
-      console.log(`[INFO] SinceLastTrendArrow => ${arrowNum} => ${sinceLastTrendEmoji}`);
-    }
-  }
-
-  // Save new measurement
   measurementsArr.push({
-    Timestamp: isoStamp, 
+    Timestamp: isoStamp,
     ValueInMgPerDl: latest.ValueInMgPerDl,
     TrendArrow: latest.TrendArrow
   });
   writeMeasurementsFile(measurementsArr);
 
-  // Update memoryData
-  memoryData.patientInfo = { patientId };
-
-  // MeasurementColor => colorName
-  const colorNumber = latest.MeasurementColor || 0;
-  const colorName = measurementColorName(colorNumber);
-
-  // mg/dL measurement
   memoryData.measurementMgdl = {
     Timestamp: isoStamp,
     ValueInMgPerDl: latest.ValueInMgPerDl,
     TrendArrow: latest.TrendArrow,
-    TrendArrowEmoji: arrowToEmoji(latest.TrendArrow),
-    SinceLastTrendArrow: sinceLastTrendEmoji,
-    MeasurementColor: colorNumber,
-    MeasurementColorName: colorName
+    TrendArrowEmoji: arrowToEmoji(latest.TrendArrow)
   };
 
-  // mmol measurement
   const mmolVal = Math.round((latest.ValueInMgPerDl / 18) * 10) / 10;
   memoryData.measurementMmol = {
     Timestamp: isoStamp,
     ValueInMmolPerL: mmolVal,
     TrendArrow: latest.TrendArrow,
-    TrendArrowEmoji: arrowToEmoji(latest.TrendArrow),
-    SinceLastTrendArrow: sinceLastTrendEmoji,
-    MeasurementColor: colorNumber,
-    MeasurementColorName: colorName
+    TrendArrowEmoji: arrowToEmoji(latest.TrendArrow)
   };
 
-  return isoStamp; // Return ISO timestamp for scheduling
+  return isoStamp;
 }
+
 
 
 // ::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::::
